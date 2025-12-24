@@ -19,7 +19,8 @@ pub fn verify_subscription(
 
     // 2. Leaf Hash
     // Input Length: 32 (Pubkey) + 8 (i64) = 40 bytes.
-    let leaf = hashv(&[&user_key.to_bytes(), &expiration.to_le_bytes()]).to_bytes();
+    let expiration_bytes = expiration.to_le_bytes();
+    let leaf = hashv(&[&user_key.to_bytes(), &expiration_bytes]).to_bytes();
 
     // 3. Verify Proof
     let mut current_hash = leaf;
