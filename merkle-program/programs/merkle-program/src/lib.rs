@@ -9,7 +9,7 @@ pub use error::*;
 pub use instructions::*;
 pub use state::*;
 
-declare_id!("FzA5z58t4RWgmDEEoHTrCnfXeZ4rgtnhU3P684J8rPdx");
+declare_id!("AHpuc2M3wbZceufaiE4Q2wyDXh198ymB1SxxpbxCzj3H");
 
 #[program]
 pub mod merkle_program {
