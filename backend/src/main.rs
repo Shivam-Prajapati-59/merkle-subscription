@@ -28,21 +28,75 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().context("Failed to load .env file")?;
 
     let pool = get_db_pool().await?;
-
-    // 4. Verify the connection is actually alive with a simple query
-    sqlx::query("SELECT 1").execute(&pool).await?;
-
     println!("✅ Successfully connected to database!");
 
-    // Generate and store 10 test keypairs
-    println!("🔑 Generating keypairs...");
-    merkle::generator::generate_and_store_keys(&pool, 10).await?;
-    println!("✅ Generated and stored 10 keypairs!");
-
-    // Build merkle tree and get root hash
-    println!("\n🌲 Building Merkle tree...");
-    let (root_hash, _tree) = merkle::tree::build_tree_from_db(&pool).await?;
+    // Build merkle tree
+    let (root_hash, tree, pubkeys) = merkle::tree::build_tree_from_db(&pool).await?;
+    let total_leaves = pubkeys.len();
     println!("✅ Merkle Root Hash: {}", root_hash);
+    println!("📊 Total leaves in tree: {}", total_leaves);
+
+    // 🔑 Manually specify the user pubkey you want to verify
+    let target_user = "BHrpzYrjvZgTcJwJubcUkiuQE2Gh7XtKeRMND5i8FTo2";
+
+    // Try to get proof for the manual user
+    if let Some((proof_bytes, index)) =
+        merkle::tree::get_proof_for_user(&tree, &pubkeys, target_user)
+    {
+        println!("\n🔐 Generating proof for: {}", target_user);
+        println!(
+            "   Index: {}, Proof size: {} bytes",
+            index,
+            proof_bytes.len()
+        );
+
+        // ✅ VERIFY
+        let is_valid = merkle::tree::verify_subscription(
+            &root_hash,
+            &proof_bytes,
+            target_user,
+            index,
+            total_leaves,
+        )?;
+
+        println!(
+            "\n✅ Verification result: {}",
+            if is_valid { "VALID ✓" } else { "INVALID ✗" }
+        );
+    } else {
+        println!("\n❌ User '{}' not found in the tree!", target_user);
+        println!("   Available users:");
+        for (i, pubkey) in pubkeys.iter().take(5).enumerate() {
+            println!("   {}. {}", i + 1, pubkey);
+        }
+        if pubkeys.len() > 5 {
+            println!("   ... and {} more", pubkeys.len() - 5);
+        }
+    }
+
+    // Test with fake user
+    println!("\n🧪 Testing with invalid user...");
+    let fake_user = "FakeUser123InvalidPubkey";
+    if let Some((proof_bytes, index)) = merkle::tree::get_proof_for_user(&tree, &pubkeys, fake_user)
+    {
+        let is_valid_fake = merkle::tree::verify_subscription(
+            &root_hash,
+            &proof_bytes,
+            fake_user,
+            index,
+            total_leaves,
+        )?;
+        println!(
+            "   Fake user verification: {}",
+            if is_valid_fake {
+                "VALID ✓"
+            } else {
+                "INVALID ✗"
+            }
+        );
+    } else {
+        println!("   ✓ Fake user correctly not found in tree");
+    }
 
     Ok(())
 }
