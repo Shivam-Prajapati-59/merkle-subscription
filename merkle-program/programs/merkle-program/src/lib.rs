@@ -28,9 +28,17 @@ pub mod merkle_program {
     /// Verify a user's subscription using merkle proof
     pub fn verify_subscription(
         ctx: Context<VerifySubscription>,
-        proof: Vec<[u8; 32]>,
+        proof_bytes: Vec<u8>,
         expiration: i64,
+        leaf_index: u64,
+        total_leaves: u64,
     ) -> Result<()> {
-        instructions::verify_subscription(ctx, proof, expiration)
+        instructions::verify_subscription(
+            ctx,
+            proof_bytes,
+            expiration,
+            leaf_index as usize,
+            total_leaves as usize,
+        )
     }
 }

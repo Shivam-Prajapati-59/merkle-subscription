@@ -4,17 +4,15 @@ use std::env;
 use std::time::Duration;
 
 mod merkle;
-mod model;
+// Assuming your model and tree logic are in these paths
+// use merkle::tree;
 
 pub async fn get_db_pool() -> Result<PgPool> {
-    // 1. Ensure the URL is available
     let database_url =
         env::var("DATABASE_URL").context("DATABASE_URL must be set in environment or .env file")?;
 
-    // 2. Configure the pool with better defaults for stability
     let pool = PgPoolOptions::new()
         .max_connections(5)
-        // Add a timeout so the app doesn't hang forever if the DB is down
         .acquire_timeout(Duration::from_secs(5))
         .connect(&database_url)
         .await
@@ -30,20 +28,25 @@ async fn main() -> Result<()> {
     let pool = get_db_pool().await?;
     println!("✅ Successfully connected to database!");
 
-    // Build merkle tree
-    let (root_hash, tree, pubkeys) = merkle::tree::build_tree_from_db(&pool).await?;
-    let total_leaves = pubkeys.len();
+    // 1. Build Merkle Tree
+    // Note: pubkeys now contains Vec<(String, i64)> i.e., (Address, Expiration)
+    let (root_hash, tree, subscriber_data) = merkle::tree::build_tree_from_db(&pool).await?;
+    let total_leaves = subscriber_data.len();
     println!("✅ Merkle Root Hash: {}", root_hash);
     println!("📊 Total leaves in tree: {}", total_leaves);
 
-    // 🔑 Manually specify the user pubkey you want to verify
+    // 🔑 User we want to verify
     let target_user = "BHrpzYrjvZgTcJwJubcUkiuQE2Gh7XtKeRMND5i8FTo2";
 
-    // Try to get proof for the manual user
+    // 2. Try to get proof for the target user
     if let Some((proof_bytes, index)) =
-        merkle::tree::get_proof_for_user(&tree, &pubkeys, target_user)
+        merkle::tree::get_proof_for_user(&tree, &subscriber_data, target_user)
     {
+        // Find the expiration time associated with this user in our local data
+        let (_, expiration_ts) = subscriber_data[index];
+
         println!("\n🔐 Generating proof for: {}", target_user);
+        println!("   Expiration Timestamp: {}", expiration_ts);
         println!(
             "   Index: {}, Proof size: {} bytes",
             index,
@@ -51,10 +54,12 @@ async fn main() -> Result<()> {
         );
 
         // ✅ VERIFY
+        // We now pass the expiration_ts so the verifier can reconstruct the leaf: Hash(PubKey + Expiry)
         let is_valid = merkle::tree::verify_subscription(
             &root_hash,
             &proof_bytes,
             target_user,
+            expiration_ts, // Added this argument
             index,
             total_leaves,
         )?;
@@ -65,37 +70,35 @@ async fn main() -> Result<()> {
         );
     } else {
         println!("\n❌ User '{}' not found in the tree!", target_user);
-        println!("   Available users:");
-        for (i, pubkey) in pubkeys.iter().take(5).enumerate() {
-            println!("   {}. {}", i + 1, pubkey);
-        }
-        if pubkeys.len() > 5 {
-            println!("   ... and {} more", pubkeys.len() - 5);
+        println!("   Available users (first 5):");
+        for (i, (pubkey, exp)) in subscriber_data.iter().take(5).enumerate() {
+            println!("   {}. {} (Expires: {})", i + 1, pubkey, exp);
         }
     }
 
-    // Test with fake user
-    println!("\n🧪 Testing with invalid user...");
-    let fake_user = "FakeUser123InvalidPubkey";
-    if let Some((proof_bytes, index)) = merkle::tree::get_proof_for_user(&tree, &pubkeys, fake_user)
+    // 🧪 Test with invalid data (Tampering attempt)
+    println!("\n🧪 Testing Tampering Attempt (Correct Proof, Wrong Expiration)...");
+    if let Some((proof_bytes, index)) =
+        merkle::tree::get_proof_for_user(&tree, &subscriber_data, target_user)
     {
-        let is_valid_fake = merkle::tree::verify_subscription(
+        let fake_expiration = 9999999999i64; // A date far in the future
+        let is_valid_tamper = merkle::tree::verify_subscription(
             &root_hash,
             &proof_bytes,
-            fake_user,
+            target_user,
+            fake_expiration,
             index,
             total_leaves,
         )?;
+
         println!(
-            "   Fake user verification: {}",
-            if is_valid_fake {
-                "VALID ✓"
+            "   Tampered data verification: {}",
+            if is_valid_tamper {
+                "FAILED (Security Risk!)"
             } else {
-                "INVALID ✗"
+                "SUCCESS (Rejected ✓)"
             }
         );
-    } else {
-        println!("   ✓ Fake user correctly not found in tree");
     }
 
     Ok(())

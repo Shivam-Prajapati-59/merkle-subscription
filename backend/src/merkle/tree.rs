@@ -17,22 +17,41 @@ impl Hasher for Sha256Hasher {
 
 pub async fn build_tree_from_db(
     pool: &PgPool,
-) -> Result<(String, MerkleTree<Sha256Hasher>, Vec<String>)> {
-    let rows = sqlx::query_as::<_, (String,)>("SELECT wallet_address FROM subscriber_storage")
-        .fetch_all(pool)
-        .await?;
+) -> Result<(String, MerkleTree<Sha256Hasher>, Vec<(String, i64)>)> {
+    // 1. Fetch both wallet and expiration
+    let rows = sqlx::query_as::<_, (String, i64)>(
+        "SELECT wallet_address, expiration_ts FROM subscriber_storage",
+    )
+    .fetch_all(pool)
+    .await?;
 
-    let mut pubkeys: Vec<String> = rows.into_iter().map(|r| r.0).collect();
-    if pubkeys.is_empty() {
-        return Err(anyhow::anyhow!("No keys found in database"));
+    let mut subscribers = rows;
+    if subscribers.is_empty() {
+        return Err(anyhow::anyhow!("No subscribers found in database"));
     }
 
-    pubkeys.sort();
-    pubkeys.dedup();
+    // Sort by wallet_address to keep the tree deterministic
+    subscribers.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let leaves: Vec<[u8; 32]> = pubkeys
+    // 2. Generate Leaves: Hash(PubKey_BYTES + Expiration)
+    // ⚠️ CRITICAL: Must decode base58 pubkey to 32 bytes (matches Solana's user_key.to_bytes())
+    let leaves: Vec<[u8; 32]> = subscribers
         .iter()
-        .map(|pk| Sha256Hasher::hash(pk.as_bytes()))
+        .map(|(pk_str, exp)| {
+            // Decode base58 pubkey to 32 bytes
+            let pubkey_bytes = bs58::decode(pk_str)
+                .into_vec()
+                .expect("Invalid base58 pubkey in database");
+
+            if pubkey_bytes.len() != 32 {
+                panic!("Pubkey must be exactly 32 bytes");
+            }
+
+            let mut payload = Vec::with_capacity(40);
+            payload.extend_from_slice(&pubkey_bytes);
+            payload.extend_from_slice(&exp.to_le_bytes());
+            Sha256Hasher::hash(&payload)
+        })
         .collect();
 
     let merkle_tree = MerkleTree::<Sha256Hasher>::from_leaves(&leaves);
@@ -40,19 +59,18 @@ pub async fn build_tree_from_db(
         .root()
         .ok_or_else(|| anyhow::anyhow!("Failed to generate root"))?;
 
-    Ok((hex::encode(root), merkle_tree, pubkeys))
+    Ok((hex::encode(root), merkle_tree, subscribers))
 }
 
 /// Returns (Serialized Proof Bytes, Leaf Index)
 pub fn get_proof_for_user(
     tree: &MerkleTree<Sha256Hasher>,
-    pubkeys: &[String],
+    subscribers: &[(String, i64)],
     user_pubkey: &str,
 ) -> Option<(Vec<u8>, usize)> {
-    let index = pubkeys.iter().position(|pk| pk == user_pubkey)?;
+    let index = subscribers.iter().position(|(pk, _)| pk == user_pubkey)?;
     let proof = tree.proof(&[index]);
 
-    // Serializing to bytes is the standard way to pass rs_merkle proofs
     Some((proof.to_bytes(), index))
 }
 
@@ -60,6 +78,7 @@ pub fn verify_subscription(
     root_hex: &str,
     proof_bytes: &[u8],
     user_pubkey: &str,
+    expiration_ts: i64,
     index: usize,
     total_subscribers: usize,
 ) -> Result<bool> {
@@ -73,8 +92,20 @@ pub fn verify_subscription(
     let proof = MerkleProof::<Sha256Hasher>::try_from(proof_bytes)
         .map_err(|_| anyhow::anyhow!("Invalid proof format"))?;
 
-    // 3. Hash the leaf
-    let leaf = Sha256Hasher::hash(user_pubkey.as_bytes());
+    // 3. Reconstruct the SAME leaf: Hash(PubKey_BYTES + Expiration)
+    // ⚠️ CRITICAL: Decode base58 pubkey to bytes (matches on-chain user_key.to_bytes())
+    let pubkey_bytes = bs58::decode(user_pubkey)
+        .into_vec()
+        .context("Invalid base58 pubkey")?;
+
+    if pubkey_bytes.len() != 32 {
+        return Err(anyhow::anyhow!("Pubkey must be 32 bytes"));
+    }
+
+    let mut payload = Vec::with_capacity(40);
+    payload.extend_from_slice(&pubkey_bytes);
+    payload.extend_from_slice(&expiration_ts.to_le_bytes());
+    let leaf = Sha256Hasher::hash(&payload);
 
     // 4. Verify
     Ok(proof.verify(root, &[index], &[leaf], total_subscribers))

@@ -1,2 +1,4 @@
 /target
 .env
+backend-authority.json
+*.json
