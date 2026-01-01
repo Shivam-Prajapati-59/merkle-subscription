@@ -4,8 +4,7 @@ use std::env;
 use std::time::Duration;
 
 mod merkle;
-// Assuming your model and tree logic are in these paths
-// use merkle::tree;
+mod model;
 
 pub async fn get_db_pool() -> Result<PgPool> {
     let database_url =
@@ -28,77 +27,124 @@ async fn main() -> Result<()> {
     let pool = get_db_pool().await?;
     println!("✅ Successfully connected to database!");
 
-    // 1. Build Merkle Tree
-    // Note: pubkeys now contains Vec<(String, i64)> i.e., (Address, Expiration)
-    let (root_hash, tree, subscriber_data) = merkle::tree::build_tree_from_db(&pool).await?;
-    let total_leaves = subscriber_data.len();
-    println!("✅ Merkle Root Hash: {}", root_hash);
-    println!("📊 Total leaves in tree: {}", total_leaves);
+    // Initialize Solana client
+    let rpc_url =
+        env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "http://localhost:8899".to_string());
+    let keypair_path =
+        env::var("SOLANA_KEYPAIR_PATH").unwrap_or_else(|_| "./backend-authority.json".to_string());
 
-    // 🔑 User we want to verify
-    let target_user = "BHrpzYrjvZgTcJwJubcUkiuQE2Gh7XtKeRMND5i8FTo2";
+    let solana_client = merkle::solana_client::SolanaClient::new(&rpc_url, &keypair_path)?;
+    println!("✅ Connected to Solana RPC: {}", rpc_url);
 
-    // 2. Try to get proof for the target user
-    if let Some((proof_bytes, index)) =
-        merkle::tree::get_proof_for_user(&tree, &subscriber_data, target_user)
-    {
-        // Find the expiration time associated with this user in our local data
-        let (_, expiration_ts) = subscriber_data[index];
-
-        println!("\n🔐 Generating proof for: {}", target_user);
-        println!("   Expiration Timestamp: {}", expiration_ts);
-        println!(
-            "   Index: {}, Proof size: {} bytes",
-            index,
-            proof_bytes.len()
-        );
-
-        // ✅ VERIFY
-        // We now pass the expiration_ts so the verifier can reconstruct the leaf: Hash(PubKey + Expiry)
-        let is_valid = merkle::tree::verify_subscription(
-            &root_hash,
-            &proof_bytes,
-            target_user,
-            expiration_ts, // Added this argument
-            index,
-            total_leaves,
-        )?;
-
-        println!(
-            "\n✅ Verification result: {}",
-            if is_valid { "VALID ✓" } else { "INVALID ✗" }
-        );
-    } else {
-        println!("\n❌ User '{}' not found in the tree!", target_user);
-        println!("   Available users (first 5):");
-        for (i, (pubkey, exp)) in subscriber_data.iter().take(5).enumerate() {
-            println!("   {}. {} (Expires: {})", i + 1, pubkey, exp);
+    // Check if config account exists, if not initialize it
+    println!("\n🔍 Checking program config...");
+    match solana_client.get_current_root().await {
+        Ok(current_root) => {
+            println!("   ✅ Config account exists");
+            println!("   Current root: {}", hex::encode(current_root));
+        }
+        Err(_) => {
+            println!("   ⚠️  Config account not found, initializing...");
+            let initial_root = [0u8; 32];
+            match solana_client.initialize_config(initial_root).await {
+                Ok(sig) => {
+                    println!("   ✅ Config initialized! Signature: {}", sig);
+                }
+                Err(e) => {
+                    eprintln!("   ❌ Failed to initialize: {}", e);
+                    return Err(e);
+                }
+            }
         }
     }
 
-    // 🧪 Test with invalid data (Tampering attempt)
-    println!("\n🧪 Testing Tampering Attempt (Correct Proof, Wrong Expiration)...");
-    if let Some((proof_bytes, index)) =
-        merkle::tree::get_proof_for_user(&tree, &subscriber_data, target_user)
-    {
-        let fake_expiration = 9999999999i64; // A date far in the future
-        let is_valid_tamper = merkle::tree::verify_subscription(
-            &root_hash,
-            &proof_bytes,
-            target_user,
-            fake_expiration,
-            index,
-            total_leaves,
-        )?;
+    // 1. Build Merkle Tree from database
+    let (root_hash, tree, subscriber_data) = merkle::tree::build_tree_from_db(&pool).await?;
+    let total_leaves = subscriber_data.len();
+    println!("\n🌲 Merkle Tree Built:");
+    println!("   Root Hash: {}", root_hash);
+    println!("   Total subscribers: {}", total_leaves);
 
-        println!(
-            "   Tampered data verification: {}",
-            if is_valid_tamper {
-                "FAILED (Security Risk!)"
-            } else {
-                "SUCCESS (Rejected ✓)"
-            }
-        );
+    // 2. Convert hex root to bytes
+    let root_bytes: [u8; 32] = hex::decode(&root_hash)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Root must be 32 bytes"))?;
+
+    // 3. Update the merkle root on-chain
+    println!("\n📤 Syncing merkle root to Solana...");
+    match solana_client.update_merkle_root(root_bytes).await {
+        Ok(signature) => {
+            println!("✅ Successfully updated on-chain!");
+
+            // 4. Store the transaction in database
+            merkle::updatestate::update_merkle_state(
+                &pool,
+                &root_hash,
+                Some(signature.to_string()),
+            )
+            .await?;
+            println!("✅ Saved to database with tx signature");
+        }
+        Err(e) => {
+            eprintln!("❌ Failed to update on-chain: {}", e);
+            eprintln!("💡 Tip: If account not initialized, run with --initialize flag");
+            eprintln!("        Make sure local validator is running: solana-test-validator");
+
+            // Still save to database but mark as not synced
+            merkle::updatestate::update_merkle_state(&pool, &root_hash, None).await?;
+        }
+    }
+
+    // 5. Verify a user proof (off-chain verification test)
+    println!("\n🔐 Testing Proof Verification...");
+    if let Some((first_user, expiration)) = subscriber_data.first() {
+        println!("   User: {}", first_user);
+        println!("   Expiration: {}", expiration);
+
+        if let Some((proof_bytes, index)) =
+            merkle::tree::get_proof_for_user(&tree, &subscriber_data, first_user)
+        {
+            let is_valid = merkle::tree::verify_subscription(
+                &root_hash,
+                &proof_bytes,
+                first_user,
+                *expiration,
+                index,
+                total_leaves,
+            )?;
+
+            println!(
+                "   Off-chain verification: {}",
+                if is_valid { "✓ VALID" } else { "✗ INVALID" }
+            );
+        }
+    }
+
+    // 6. Test tampering detection
+    println!("\n🧪 Testing Tampering Detection...");
+    if let Some((first_user, _)) = subscriber_data.first() {
+        if let Some((proof_bytes, index)) =
+            merkle::tree::get_proof_for_user(&tree, &subscriber_data, first_user)
+        {
+            let fake_expiration = 9999999999i64;
+            let is_valid_tamper = merkle::tree::verify_subscription(
+                &root_hash,
+                &proof_bytes,
+                first_user,
+                fake_expiration,
+                index,
+                total_leaves,
+            )?;
+
+            println!(
+                "   Tampered expiration: {}",
+                if is_valid_tamper {
+                    "❌ ACCEPTED (Bug!)"
+                } else {
+                    "✓ REJECTED (Correct)"
+                }
+            );
+        }
     }
 
     Ok(())
